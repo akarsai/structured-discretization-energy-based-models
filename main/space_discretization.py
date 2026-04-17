@@ -25,6 +25,106 @@ from scipy.interpolate import griddata
 from helpers.triangle import map_points_to_triangle, get_triangle_jacobian_and_area, get_triangle_quadrature_points_and_weights
 from helpers.other import dprint, plot_matrix, style
 
+class Mesh1D:
+    """
+    1D mesh for finite element method with piecewise linear elements.
+    Creates a uniform mesh on interval [0, L] with n elements.
+    """
+
+    def __init__(
+            self,
+            L: float = 1.0,
+            n: int = 10,
+            ):
+        
+        self.L = L
+        self.n = n
+        
+        # calculate mesh width
+        self.h = self.L / self.n
+        
+        # calculate vertex coordinates (nodes)
+        self.vertices = jnp.linspace(0, self.L, self.n + 1)
+        
+        # calculate element vertex indices (connectivity)
+        # each element connects two consecutive nodes
+        element_vertices_indices_list = []
+        for i in range(self.n):
+            element_vertices_indices_list.append([i, i+1])
+        self.element_vertices_indices_list = element_vertices_indices_list
+        
+        # calculate element vertices list (actual coordinates)
+        self.element_vertices_list = jnp.array([
+            [self.vertices[l] for l in k]
+            for k in element_vertices_indices_list
+        ])
+        
+        # get number of elements
+        self.num_elements = self.element_vertices_list.shape[0]  # or self.n
+        
+        # get total number of (unique) vertices
+        self.num_vertices = self.vertices.shape[0]  # or self.n + 1
+        
+        # boundary vertices (endpoints)
+        self.boundary_vertices = jnp.array([0, self.n])  # left and right endpoints
+        self.num_boundary_vertices = 2
+        
+        # left and right boundary node indices
+        self.left_vertex = 0
+        self.right_vertex = self.n
+        
+    def map_local_points_to_mesh(self, local_points: jnp.ndarray) -> jnp.ndarray:
+        """
+        Map points from reference interval [-1, 1] to physical elements.
+        
+        Args:
+            local_points: points on reference interval, shape (num_points,)
+            
+        Returns:
+            mapped_points: points on all elements, shape (num_elements, num_points)
+        """
+        num_points = local_points.shape[0]
+        mapped_points = np.zeros((self.num_elements, num_points))
+        
+        for elem_index, elem_vertices in enumerate(self.element_vertices_list):
+            # affine mapping from [-1, 1] to [x_left, x_right]
+            x_left, x_right = elem_vertices
+            # mapping: x = (x_right - x_left)/2 * xi + (x_right + x_left)/2
+            mapped = 0.5 * (x_right - x_left) * local_points + 0.5 * (x_right + x_left)
+            mapped_points[elem_index, :] = mapped
+            
+        return jnp.array(mapped_points)
+    
+    def show(self, suppress=False):
+        """Visualize the 1D mesh."""
+        fig, ax = plt.subplots()
+        
+        vertices = np.array(self.vertices)
+        
+        # plot nodes
+        ax.plot(vertices, np.zeros_like(vertices), 'ko', markersize=8)
+        
+        # plot elements
+        for elem_vertices in self.element_vertices_list:
+            x_vals = np.array([self.vertices[elem_vertices[0]],
+                              self.vertices[elem_vertices[1]]])
+            ax.plot(x_vals, [0, 0], 'b-', linewidth=2)
+        
+        # highlight boundary nodes
+        ax.plot([vertices[0], vertices[-1]], [0, 0], 'ro', markersize=10,
+                label='Boundary nodes')
+        
+        ax.set_xlabel('$x$')
+        ax.set_title('1D finite element mesh')
+        ax.set_ylim(-0.5, 0.5)
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        if not suppress:
+            plt.tight_layout()
+            plt.show()
+        
+        return fig, ax
 
 class Mesh:
 
@@ -172,6 +272,543 @@ class Mesh:
             plt.show()
 
         return fig, ax
+
+class AnsatzSpace1D:
+    """
+    1D ansatz space with piecewise linear basis functions (hat functions).
+    """
+
+    def __init__(
+            self,
+            mesh: Mesh1D = None,
+            mesh_settings: dict = None,
+            degree: int = 1,
+            inner_product: str = 'H1'
+            ):
+
+        if mesh is None:
+            if mesh_settings is None:
+                mesh_settings = {}
+            mesh = Mesh1D(**mesh_settings)
+            
+        self.mesh = mesh
+        self.degree = degree
+        self.inner_product = inner_product  # inner product, L2 or H1
+
+        if not self.degree == 1:
+            raise ValueError('degree must be 1')
+        
+        if self.inner_product not in ['H1', 'L2'] and not self.inner_product.startswith('W1,'):
+            raise ValueError('inner product must be H1, L2, or W1,p (e.g., W1,1.5)')
+
+        # dimension of the ansatz space equals number of vertices
+        self.dim = self.mesh.num_vertices
+        
+        # create lookup table for element vertex indices
+        self.element_vertex_indices_lookup = jnp.array(
+            self.mesh.element_vertices_indices_list, dtype=jnp.int32
+        )
+        
+        # quadrature: use 2-point Gauss quadrature on reference interval [-1, 1]
+        # for linear elements, 2 points give exact integration
+        self.quad_nodes_ref = jnp.array([-1.0/jnp.sqrt(3.0), 1.0/jnp.sqrt(3.0)])
+        self.quad_weights_ref = jnp.array([1.0, 1.0])
+        self.num_quad_nodes = self.quad_weights_ref.size
+        
+        # map quadrature points to physical mesh
+        self.mapped_quad_nodes = self.mesh.map_local_points_to_mesh(self.quad_nodes_ref)
+        
+        # calculate local basis functions on reference element [-1, 1]
+        # for linear elements: phi_0(xi) = (1-xi)/2, phi_1(xi) = (1+xi)/2
+        self.lbf_ref, self.grad_lbf_ref = self.get_local_basis_functions(
+            self.quad_nodes_ref
+        )
+        
+        # jacobian for mapping from reference to physical element
+        # J = h/2 where h is element length
+        self.jacobian = self.mesh.h / 2.0
+        
+        # quadrature weights on physical elements
+        self.quad_weights_physical = self.jacobian * self.quad_weights_ref
+        
+        # precompute global basis functions on quadrature points
+        self.gbf_quad, self.grad_gbf_quad = self.get_global_basis_functions(
+            self.quad_nodes_ref
+        )
+        
+        # assemble sparse mass matrices
+        self.l2_mass_matrix = self.get_l2_mass_matrix()
+        self.l2_stiffness_matrix = self.get_l2_stiffness_matrix()
+        self.l2_mixed_matrix = self.get_l2_mixed_matrix()
+        self.mass_matrix = self.l2_mass_matrix
+        if self.inner_product == 'H1':
+            self.mass_matrix = self.mass_matrix + self.l2_stiffness_matrix
+        elif self.inner_product.startswith('W1,'):
+            self.mass_matrix = None
+
+        
+    def get_local_basis_functions(
+            self,
+            points_in_ref_element: jnp.ndarray
+            ) -> tuple:
+        """
+        Compute piecewise linear basis functions on reference element [-1, 1].
+        
+        For linear elements:
+        phi_0(xi) = (1 - xi) / 2
+        phi_1(xi) = (1 + xi) / 2
+        
+        Args:
+            points_in_ref_element: points on reference element [-1, 1]
+            
+        Returns:
+            values: basis function values, shape (2, num_points)
+            grad: basis function derivatives, shape (2, num_points)
+        """
+        xi = points_in_ref_element
+        num_points = xi.shape[0]
+        
+        # basis function values[web:5][web:6]
+        values = jnp.array([
+            (1.0 - xi) / 2.0,  # phi_0
+            (1.0 + xi) / 2.0   # phi_1
+        ])
+        
+        # basis function derivatives with respect to xi
+        grad = jnp.array([
+            -0.5 * jnp.ones(num_points),  # d/dxi phi_0
+             0.5 * jnp.ones(num_points)   # d/dxi phi_1
+        ])
+        
+        return values, grad
+    
+    def get_global_basis_functions(
+            self,
+            points_in_ref_element: jnp.ndarray,
+            ):
+        """
+        Construct global basis functions from local ones.
+        
+        Args:
+            points_in_ref_element: points on reference element [-1, 1]
+            
+        Returns:
+            gbf_values: shape (dim, num_elements, num_points)
+            gbf_grad: shape (dim, num_elements, num_points)
+        """
+        num_points = points_in_ref_element.shape[0]
+        
+        # get local basis functions
+        lbf_values, lbf_grad = self.get_local_basis_functions(points_in_ref_element)
+        
+        # transform gradients to physical coordinates
+        # dxi/dx = 2/h, so dphi/dx = dphi/dxi * dxi/dx = dphi/dxi * 2/h
+        lbf_grad_physical = lbf_grad / self.jacobian
+        
+        # initialize global arrays
+        num_elements = self.mesh.num_elements
+        gbf_values = jnp.zeros((self.dim, num_elements, num_points))
+        gbf_grad = jnp.zeros((self.dim, num_elements, num_points))
+        
+        # assemble global basis functions
+        elements = jnp.array(self.mesh.element_vertices_indices_list)
+        
+        def element_loop_body(elem_idx, arrays):
+            gbf_values, gbf_grad = arrays
+            
+            # get global indices for this element
+            global_indices = elements[elem_idx]
+            
+            def local_basis_loop_body(local_idx, arrays):
+                gbf_values, gbf_grad = arrays
+                global_idx = global_indices[local_idx]
+                
+                # set values and gradients
+                gbf_values = gbf_values.at[global_idx, elem_idx, :].set(
+                    lbf_values[local_idx, :]
+                )
+                gbf_grad = gbf_grad.at[global_idx, elem_idx, :].set(
+                    lbf_grad_physical[local_idx, :]
+                )
+                
+                return gbf_values, gbf_grad
+            
+            return jax.lax.fori_loop(
+                0, 2, local_basis_loop_body, (gbf_values, gbf_grad)
+            )
+        
+        gbf_values, gbf_grad = jax.lax.fori_loop(
+            0, num_elements, element_loop_body, (gbf_values, gbf_grad)
+        )
+        
+        return gbf_values, gbf_grad
+    
+    @partial(jax.jit, static_argnums=(0,))
+    def quadrature_with_values_physical(
+            self,
+            values_at_quad_nodes: jnp.ndarray,
+            ):
+        """Integrate using quadrature on physical elements."""
+        return jnp.einsum('...q,q->...', values_at_quad_nodes, self.quad_weights_physical)
+    
+    def get_l2_mass_matrix(self):
+        """
+        Assemble L2 mass matrix for 1D piecewise linear elements[web:5][web:9].
+        
+        Local mass matrix for element of length h:
+        M_local = (h/6) * [[2, 1],
+                           [1, 2]]
+        """
+        # local mass matrix pattern
+        local_mass = jnp.array([[2.0, 1.0],
+                                [1.0, 2.0]]) * (self.mesh.h / 6.0)
+        
+        num_elements = self.mesh.num_elements
+        data = jnp.tile(local_mass.flatten(), num_elements)
+        
+        indices_shape = (num_elements * 4, 2)  # 4 entries per element (2x2)
+        indices = jnp.zeros(indices_shape, dtype=jnp.int32)
+        
+        def body_fun(e, idx_array):
+            nodes = self.element_vertex_indices_lookup[e]
+            row_indices = jnp.repeat(nodes, 2)
+            col_indices = jnp.tile(nodes, 2)
+            
+            current_indices = jnp.stack([row_indices, col_indices], axis=1)
+            start_idx = e * 4
+            
+            return jax.lax.dynamic_update_slice(
+                idx_array,
+                current_indices,
+                (start_idx, 0)
+            )
+        
+        indices = jax.lax.fori_loop(0, num_elements, body_fun, indices)
+        
+        M = sparse.BCOO(
+            (data, indices),
+            shape=(self.dim, self.dim),
+            indices_sorted=True,
+            unique_indices=True,
+        )
+        
+        return M
+    
+    def get_l2_stiffness_matrix(self):
+        """
+        Assemble L2 stiffness matrix for 1D piecewise linear elements[web:5][web:9].
+        
+        Local stiffness matrix for element of length h:
+        K_local = (1/h) * [[ 1, -1],
+                           [-1,  1]]
+        """
+        # local stiffness matrix pattern
+        local_stiffness = jnp.array([[ 1.0, -1.0],
+                                      [-1.0,  1.0]]) / self.mesh.h
+        
+        num_elements = self.mesh.num_elements
+        data = jnp.tile(local_stiffness.flatten(), num_elements)
+        
+        indices_shape = (num_elements * 4, 2)
+        indices = jnp.zeros(indices_shape, dtype=jnp.int32)
+        
+        def body_fun(e, idx_array):
+            nodes = self.element_vertex_indices_lookup[e]
+            row_indices = jnp.repeat(nodes, 2)
+            col_indices = jnp.tile(nodes, 2)
+            
+            current_indices = jnp.stack([row_indices, col_indices], axis=1)
+            start_idx = e * 4
+            
+            return jax.lax.dynamic_update_slice(
+                idx_array,
+                current_indices,
+                (start_idx, 0)
+            )
+        
+        indices = jax.lax.fori_loop(0, num_elements, body_fun, indices)
+        
+        K = sparse.BCOO(
+            (data, indices),
+            shape=(self.dim, self.dim),
+            indices_sorted=True,
+            unique_indices=True,
+        )
+        
+        return K
+    
+    def get_l2_mixed_matrix(self):
+        """
+        Assemble mixed mass-derivative matrix for 1D:
+        C[i,j] = ∫_Ω (dφ_i/dx) φ_j dx
+        
+        This matrix couples derivatives of basis functions with basis functions.
+        For piecewise linear elements on uniform mesh of length h:
+        
+        Local matrix (element connecting nodes k and k+1):
+        C_local = [[−1/2,  1/2],
+                   [−1/2,  1/2]]
+        
+        Note: This matrix is NOT symmetric.
+        
+        Returns:
+            C: sparse BCOO matrix of shape (dim, dim)
+        """
+        # For 1D linear elements, we need to compute:
+        # ∫_element (dφ_i/dx) φ_j dx
+        
+        # On reference element [-1,1] with mapping x = h/2 * ξ + x_center:
+        # dφ_i/dx = (dφ_i/dξ) * (dξ/dx) = (dφ_i/dξ) * (2/h)
+        # dx = (h/2) dξ
+        
+        # For local basis functions:
+        # φ_0(ξ) = (1-ξ)/2,  dφ_0/dξ = -1/2
+        # φ_1(ξ) = (1+ξ)/2,  dφ_1/dξ =  1/2
+        
+        # Local matrix computation using quadrature:
+        num_elements = self.mesh.num_elements
+        h = self.mesh.h
+        
+        # Compute local matrix entries using precomputed basis functions
+        # grad_lbf_ref has shape (2, num_quad_nodes) - derivatives w.r.t. ξ
+        # lbf_ref has shape (2, num_quad_nodes) - function values
+        
+        # Transform derivative: dφ/dx = dφ/dξ * (2/h)
+        grad_lbf_physical = self.grad_lbf_ref / self.jacobian  # shape (2, num_quad_nodes)
+        
+        # Compute C_local[i,j] = ∫ (dφ_i/dx) φ_j dx
+        local_matrix = jnp.zeros((2, 2))
+        for i in range(2):
+            for j in range(2):
+                # Integrand: grad_lbf_physical[i] * lbf_ref[j]
+                integrand = grad_lbf_physical[i, :] * self.lbf_ref[j, :]
+                # Integrate using quadrature
+                local_matrix = local_matrix.at[i, j].set(
+                    jnp.sum(integrand * self.quad_weights_physical)
+                )
+        
+        # Assemble global matrix
+        data = jnp.tile(local_matrix.flatten(), num_elements)
+        indices_shape = (num_elements * 4, 2)
+        indices = jnp.zeros(indices_shape, dtype=jnp.int32)
+        
+        def body_fun(e, idx_array):
+            nodes = self.element_vertex_indices_lookup[e]
+            row_indices = jnp.repeat(nodes, 2)
+            col_indices = jnp.tile(nodes, 2)
+            current_indices = jnp.stack([row_indices, col_indices], axis=1)
+            start_idx = e * 4
+            return jax.lax.dynamic_update_slice(
+                idx_array,
+                current_indices,
+                (start_idx, 0)
+            )
+        
+        indices = jax.lax.fori_loop(0, num_elements, body_fun, indices)
+        
+        return sparse.BCOO(
+            (data, indices),
+            shape=(self.dim, self.dim),
+            indices_sorted=True,
+            unique_indices=True,
+        )
+
+    
+    def get_boundary_mass_matrix(self):
+        """
+        Boundary mass matrix for 1D (just the two endpoints).
+        Simply returns identity at boundary nodes.
+        """
+        data = jnp.ones(2)
+        indices = jnp.array([[0, 0], [self.mesh.n, self.mesh.n]])
+        
+        MB = sparse.BCOO(
+            (data, indices),
+            shape=(self.dim, self.dim),
+            indices_sorted=True,
+            unique_indices=True,
+        )
+        
+        return MB
+    
+    def get_norm(self, coeffs: jnp.ndarray, norm_type: str = None) -> jnp.ndarray:
+        """
+        computes the spatial norm of a function given its coefficient vector.
+        supported norm_types: 'L2', 'H1', 'W1,p', 'L,p' (e.g., 'W1,1.5' or 'L,1.5').
+        """
+        if norm_type is None:
+            norm_type = self.inner_product
+            
+        if norm_type == 'L2':
+            return jnp.sqrt(coeffs.T @ self.l2_mass_matrix @ coeffs)
+            
+        elif norm_type == 'H1':
+            H1_matrix = self.l2_mass_matrix + self.l2_stiffness_matrix
+            return jnp.sqrt(coeffs.T @ H1_matrix @ coeffs)
+            
+        elif norm_type.startswith('W1,'):
+            p = float(norm_type.split(',')[1])
+            u_val, grad_u_val = self.eval_coeffs_quad(coeffs)
+            
+            u_integrand = jnp.abs(u_val)**p
+            grad_integrand = jnp.abs(grad_u_val)**p # only works for 1D
+            
+            integral = jnp.sum(self.quadrature_with_values_physical(u_integrand + grad_integrand))
+            
+            return integral**(1.0/p)
+        
+        else:
+            raise ValueError(f"unknown norm_type: {norm_type}")
+
+    
+    @partial(jax.jit, static_argnums=(0,3))
+    def get_projection_coeffs(
+            self,
+            u_values_on_element_quadpoints: jnp.ndarray,
+            grad_u_values_on_element_quadpoints: jnp.ndarray = None,
+            inner_product: str = None,
+            ):
+        """
+        Project a function onto the ansatz space.
+        
+        Args:
+            u_values_on_element_quadpoints: function values at quad points
+            grad_u_values_on_element_quadpoints: gradient values at quad points
+            inner_product: 'L2' or 'H1'
+            
+        Returns:
+            coefficients of the projection
+        """
+        assert u_values_on_element_quadpoints.size == self.mesh.num_elements * self.num_quad_nodes
+        
+        if inner_product is None:
+            inner_product = self.inner_product
+        assert inner_product in ['H1', 'L2']
+        
+        if inner_product == 'H1':
+            assert grad_u_values_on_element_quadpoints is not None
+        else:
+            grad_u_values_on_element_quadpoints = jnp.zeros((self.mesh.num_elements, self.num_quad_nodes))
+        
+        # reshape if necessary
+        u_values_on_element_quadpoints = u_values_on_element_quadpoints.reshape(
+            (self.mesh.num_elements, self.num_quad_nodes)
+        )
+        if inner_product == 'H1':
+            grad_u_values_on_element_quadpoints = grad_u_values_on_element_quadpoints.reshape(
+                (self.mesh.num_elements, self.num_quad_nodes)
+            )
+        
+        # L2 part
+        u_gbf = jnp.einsum('eq,beq->beq', u_values_on_element_quadpoints, self.gbf_quad)
+        l2_integral = jnp.sum(self.quadrature_with_values_physical(u_gbf), axis=1)
+        
+        # H1 part
+        def get_h1_integral():
+            grad_u_grad_gbf = jnp.einsum('eq,beq->beq',
+                                         grad_u_values_on_element_quadpoints,
+                                         self.grad_gbf_quad)
+            return jnp.sum(self.quadrature_with_values_physical(grad_u_grad_gbf), axis=1)
+        
+        h1_integral = jax.lax.cond(
+            inner_product == 'H1',
+            get_h1_integral,
+            lambda: jnp.zeros((self.dim,)),
+        )
+        
+        inner_product_vector = (l2_integral + h1_integral).reshape((-1,))
+        
+        # solve linear system
+        mass_matrix = self.l2_mass_matrix
+        if inner_product == 'H1':
+            mass_matrix = mass_matrix + self.l2_stiffness_matrix
+        
+        coeffs, info = bicgstab(mass_matrix, inner_product_vector,
+                               tol=1e-14, atol=1e-14, maxiter=1000)
+        
+        return coeffs
+    
+    def eval_coeffs(
+            self,
+            coeffs: jnp.ndarray,
+            points_in_ref_element: jnp.ndarray,
+            ):
+        """
+        Evaluate function at given points.
+        
+        Args:
+            coeffs: coefficient vector, shape (dim,)
+            points_in_ref_element: points on reference element [-1, 1]
+            
+        Returns:
+            values and gradients on all elements
+        """
+        
+        gbf, grad_gbf = self.get_global_basis_functions(points_in_ref_element)
+        return (jnp.einsum('b,bep->ep', coeffs, gbf),
+                jnp.einsum('b,bep->ep', coeffs, grad_gbf))
+    
+    def eval_coeffs_quad(
+            self,
+            coeffs: jnp.ndarray,
+            ):
+        """
+        evaluate the function corresponding to the coefficient vector at the points self.mesh.map_local_points_to_mesh(self.quad_nodes_unit_triangle))
+        
+        Args:
+            coeffs: coefficients, shape (self.dim,)
+
+        Returns:
+            tuple (values, grad), shape (self.mesh.num_elements, self.num_quad_nodes) and (self.mesh.num_elements, self.num_quad_nodes)
+        """
+        
+        return (
+            jnp.einsum('b,bep->ep', coeffs, self.gbf_quad),
+            jnp.einsum('b,bep->ep', coeffs, self.grad_gbf_quad)
+            )
+    
+    def visualize_coefficient_vector(
+            self,
+            coeffs: jnp.ndarray,
+            title: str = None,
+            savepath: str = None,
+            ):
+        """Visualize the 1D function."""
+        assert coeffs.size == self.dim
+        
+        # create fine grid for visualization
+        x_fine = jnp.linspace(0, self.mesh.L, 200)
+        
+        # evaluate at fine points
+        # for 1D, use the node values directly and interpolate
+        x_nodes = self.mesh.vertices
+        u_nodes = coeffs
+        
+        # linear interpolation
+        u_fine = jnp.interp(x_fine, x_nodes, u_nodes)
+        
+        fig, ax = plt.subplots()
+        ax.plot(x_fine, u_fine, 'b-', linewidth=2, label='FEM solution')
+        ax.set_xlabel('$x$')
+        ax.set_ylabel('$z(x)$')
+        # ax.grid(True, alpha=0.3)
+        # ax.legend()
+        
+        if title is not None:
+            ax.set_title(title)
+        
+        if savepath is not None:
+            fig.tight_layout()
+            fig.savefig(savepath + '.pgf')
+            fig.savefig(savepath + '.png')
+            print(f'figure saved under savepath {savepath} (as pgf and png)')
+        
+        fig.tight_layout()
+        plt.show()
+        
+        return fig, ax
+
+
 
 class AnsatzSpace:
 
@@ -528,6 +1165,24 @@ class AnsatzSpace:
         
         return K
     
+    def get_norm(self, coeffs: jnp.ndarray, norm_type: str = None) -> jnp.ndarray:
+        """
+        computes the spatial norm of a function given its coefficient vector.
+        supported norm_types: 'L2', 'H1'
+        """
+        if norm_type is None:
+            norm_type = self.inner_product
+            
+        if norm_type == 'L2':
+            return jnp.sqrt(coeffs.T @ self.l2_mass_matrix @ coeffs)
+            
+        elif norm_type == 'H1':
+            H1_matrix = self.l2_mass_matrix + self.l2_stiffness_matrix
+            return jnp.sqrt(coeffs.T @ H1_matrix @ coeffs)
+            
+        else:
+            raise ValueError(f"unsupported norm_type: {norm_type}")
+    
     def get_boundary_mass_matrix(self):
         """
         Efficient boundary mass matrix assembly using precomputed edge contributions
@@ -575,7 +1230,7 @@ class AnsatzSpace:
             )
         
         return MB
-        
+    
     def get_boundary_extension(self):
         """
         creates extension matrix R that maps boundary nodes to full space nodes
@@ -799,68 +1454,4 @@ class AnsatzSpace:
 
         return
 
-if __name__ == '__main__':
-
-    jax.config.update("jax_enable_x64", True)
-
-    from helpers.other import mpl_settings
-    # mpl_settings(fontsize=18)
-    mpl_settings()
-
-    # create ansatz space
-    space = AnsatzSpace()
-    
-    MB = space.boundary_mass_matrix.todense()
-    plot_matrix(MB, title='boundary mass matrix')
-    # dprint(MB.shape)
-    # dprint(space.dim)
-    #
-    # R = space.boundary_extension_matrix.todense()
-    # plot_matrix(R, title='boundary extension matrix')
-    # dprint(R.shape)
-    
-    # consistency test
-    ones = jnp.ones((space.dim,))
-    boundary_gradients = space.boundary_grad_matrix @ ones
-    dprint(jnp.linalg.norm(boundary_gradients)) # should be zero
-    boundary_integral = ones.T @ MB @ ones  # should equal perimeter of domain
-    dprint(boundary_integral)
-    dprint(2*space.mesh.Lx + 2*space.mesh.Ly)
-    
-    M = space.get_l2_mass_matrix_naive()
-    dprint(jnp.linalg.norm(M - space.l2_mass_matrix.todense()))
-
-    K = space.get_l2_stiffness_matrix_naive()
-    dprint(jnp.linalg.norm(K - space.l2_stiffness_matrix.todense()))
-
-    # # setup coefficient vector
-    # coeffs = jnp.zeros((space.dim,))
-    # coeffs = coeffs.at[4].set(0.8)
-    # coeffs = coeffs.at[1].set(0.5)
-    # coeffs = coeffs.at[2].set(1.0)
-    #
-    # # # test visualization
-    # space.visualize_coefficient_vector(coeffs)
-    #
-    # # test get_projection_coeffs
-    # # obtain values on triangles
-    # u_values_on_triangle_quadpoints = jnp.einsum('b,btq->tq', coeffs, space.gbf_quad)
-    # grad_u_values_on_triangle_quadpoints = jnp.einsum('b,btqn->tqn', coeffs, space.grad_gbf_quad)
-    # projection_coeffs = space.get_projection_coeffs(u_values_on_triangle_quadpoints, grad_u_values_on_triangle_quadpoints).reshape((space.dim,))
-    # dprint(coeffs)
-    # dprint(projection_coeffs)
-    # dprint(jnp.linalg.norm(coeffs - projection_coeffs))
-
-
-
-
-
-
-
-
-
-
-
-
-    pass
 

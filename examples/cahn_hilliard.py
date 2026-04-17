@@ -27,6 +27,7 @@ from main.time_discretization import projection_method
 # other
 from helpers.other import dprint
 from timeit import default_timer as timer
+import pickle
 
 class CahnHilliard(EnergyBasedModel_LinearJR):
     
@@ -92,12 +93,14 @@ class CahnHilliard(EnergyBasedModel_LinearJR):
         # compute consistent initial condition - implicitly assumes u2(t_0) = nabla v(t_0) \dot n = 0
         # the initial condition w0 is determined via
         # eps * stiffness_matrix @ v0 + 1/eps * [int_Omega W'(v0) phi_i dx]_i=1,...,dim = mass_matrix @ w0
-        Wprime_v0 = self.Wprime(self.v_init_quad) # shape (self.space.mesh.num_triangles, self.space.num_quad_nodes)
+        # reconstruct discrete v_h at quad nodes from v0 coefficients to avoid disc
+        v0_quad_discrete = jnp.einsum('b,btq->tq', v0, self.space.gbf_quad)
+        Wprime_v0 = self.Wprime(v0_quad_discrete) # shape (self.space.mesh.num_triangles, self.space.num_quad_nodes)
         Wprime_v0_gbf = jnp.einsum('tq,btq->btq', Wprime_v0, self.space.gbf_quad)
         int_Wprime_v0_gbf = jnp.sum(self.space.quadrature_with_values_mapped(Wprime_v0_gbf), axis=1) # shape (b,)
         rhs_linear_system = self.eps * self.space.l2_stiffness_matrix @ v0 + 1/self.eps * int_Wprime_v0_gbf
         # solve the linear system
-        w0 = bicgstab(self.space.l2_mass_matrix, rhs_linear_system)[0]
+        w0 = bicgstab(self.space.l2_mass_matrix, rhs_linear_system, tol=1e-14)[0]
         self.initial_condition = jnp.hstack((v0, w0))
     
     def B(self, u):
@@ -158,18 +161,19 @@ class CahnHilliard(EnergyBasedModel_LinearJR):
         dt_v_manufactured_quad = jax.vmap(lambda t: dt_v_manufactured(self.space.mapped_quad_nodes, t), in_axes=0)
         projection_vmap = jax.vmap(lambda x: self.space.get_projection_coeffs(x, inner_product='L2'), in_axes=0)
         z1 = lambda t: projection_vmap(v_manufactured_quad(t))
+        vh_quad = lambda t: jnp.einsum('...b,btq->...tq', z1(t), self.space.gbf_quad) # recompute vh from z1 coefficients
         dt_z1 = lambda t: projection_vmap(dt_v_manufactured_quad(t))
         Wprime_vmap = jax.vmap(lambda x: self.Wprime(x), in_axes=0)
-        Wprime_v = lambda t: Wprime_vmap(v_manufactured_quad(t)) # output has shape (..., self.space.mesh.num_triangles, self.space.num_quad_nodes)
-        Wprime_v_gbf = lambda t: jnp.einsum('...tq,btq->...btq', Wprime_v(t), self.space.gbf_quad) # output has shape (..., self.dim, self.space.mesh.num_triangles, self.space.num_quad_nodes)
-        int_Wprime_v_gbf = lambda t: jnp.sum(self.space.quadrature_with_values_mapped(Wprime_v_gbf(t)), axis=2) # output has shape (..., self.dim, self.space.mesh.num_triangles). axis=2 since time is at axis=0
+        Wprime_vh = lambda t: Wprime_vmap(vh_quad(t)) # output has shape (..., self.space.mesh.num_triangles, self.space.num_quad_nodes)
+        Wprime_vh_gbf = lambda t: jnp.einsum('...tq,btq->...btq', Wprime_vh(t), self.space.gbf_quad) # output has shape (..., self.dim, self.space.mesh.num_triangles, self.space.num_quad_nodes)
+        int_Wprime_vh_gbf = lambda t: jnp.sum(self.space.quadrature_with_values_mapped(Wprime_vh_gbf(t)), axis=2) # output has shape (..., self.dim, self.space.mesh.num_triangles). axis=2 since time is at axis=0
         # compute consistent w via
         # eps * stiffness_matrix @ v + 1/eps * [int_Omega W'(v) phi_i dx]_i=1,...,dim = mass_matrix @ w # implicitly assumes zero flux of w, but this is irrelevant for manufactured solution
         # compute associated boundary control values
         stiffness_vmap = jax.vmap(lambda x: self.space.l2_stiffness_matrix @ x, in_axes=0)
-        rhs_linear_system = lambda t: self.eps * stiffness_vmap(z1(t)) + 1/self.eps * int_Wprime_v_gbf(t)
+        rhs_linear_system = lambda t: self.eps * stiffness_vmap(z1(t)) + 1/self.eps * int_Wprime_vh_gbf(t)
         # solve the linear system
-        solver = jax.vmap(lambda x: bicgstab(self.space.l2_mass_matrix, x)[0], in_axes=0)
+        solver = jax.vmap(lambda x: bicgstab(self.space.l2_mass_matrix, x, tol=1e-14)[0], in_axes=0)
         z3 = lambda t: solver(rhs_linear_system(t))
         
         # empty array callable
@@ -210,7 +214,13 @@ class CahnHilliard(EnergyBasedModel_LinearJR):
     
 class CahnHilliardReducedOrder(CahnHilliard):
     
-    def __init__(self, r1: int = 5, r3: int = 5, **kwargs):
+    def __init__(
+            self,
+            picklepath: str = None,
+            r1: int = 5,
+            r3: int = 5,
+            **kwargs,
+            ):
         
         super().__init__(**kwargs)
         
@@ -223,19 +233,37 @@ class CahnHilliardReducedOrder(CahnHilliard):
         nt = int(T*100)+1
         tt = jnp.linspace(0, T, nt)
         degree = 3
-        s = timer()
-        _, zz, dt_zz = projection_method(
-            CahnHilliard(**kwargs), # fom
-            tt,
-            z0=self.initial_condition,
-            control=self.default_control,
-            degree=degree,
-            num_quad_nodes=2*degree,
-            num_proj_nodes=2*degree,
-            # debug=True,
-            )['boundaries']
-        e = timer()
-        print(f'[cahn hilliard rom] full order simulation took {e-s:.2f} seconds')
+        num_quad_nodes = 2*degree
+        num_proj_nodes = 2*degree
+        picklename = f'{picklepath}_n{degree}_qn{num_quad_nodes}_pn{num_proj_nodes}_M{nt}' # needs to be updated
+        
+        try: # try to skip also the evaluation
+            with open(f'{picklename}.pickle','rb') as f:
+                proj_solution = pickle.load(f)['proj_solution']
+            print(f'\tFOM result was loaded')
+
+        except FileNotFoundError:
+            s = timer()
+            proj_solution = projection_method(
+                CahnHilliard(**kwargs), # fom
+                tt,
+                z0=self.initial_condition,
+                control=self.default_control,
+                degree=degree,
+                num_quad_nodes=2*degree,
+                num_proj_nodes=2*degree,
+                # debug=True,
+                )
+            e = timer()
+            print(f'[cahn hilliard rom] full order simulation took {e-s:.2f} seconds')
+            
+            # save file
+            if picklepath is not None: # save at valid path
+                with open(f'{picklename}.pickle','wb') as f:
+                    pickle.dump({'proj_solution': proj_solution},f)
+                print(f'\tFOM result was written')
+        
+        _, zz, dt_zz = proj_solution['boundaries']
         Q1 = zz[:,:self.dims[0]].T # snapshot matrix for z1 states - time index in second position
         Q3 = zz[:,self.dims[0]:].T # snapshot matrix for z3 states - time index in second position
         U1, _, _ = jnp.linalg.svd(Q1, full_matrices=False)
@@ -267,307 +295,6 @@ class CahnHilliardReducedOrder(CahnHilliard):
         
     def B(self, u):
         return self.V.T @ super().B(u)
-
-    
-
-if __name__ == '__main__':
-    
-    from helpers.other import mpl_settings
-    # mpl_settings()
-    
-    import matplotlib
-    matplotlib.rc('axes.formatter', useoffset=False)
-    
-    jax.config.update("jax_enable_x64", True)
-    
-    
-    # ch = CahnHilliard()
-    # # # test J and R
-    # # J = ch.J_matrix.todense()
-    # # R = ch.R_matrix.todense()
-    # # plot_matrix(J, 'J')
-    # # plot_matrix(R, 'R')
-    # # dprint(jnp.linalg.norm(J+J.T)) # should be zero
-    # # dprint(jnp.linalg.norm(R-R.T)) # should be zero
-    #
-    # # # test hamiltonian
-    # # z1 = jnp.zeros((ch.space.dim,)).at[ch.space.dim//2+1].set(1.0)
-    # # # ch.space.visualize_coefficient_vector(z1)
-    # # h = ch.hamiltonian(z1,None)
-    # # dprint(h.shape)
-    # # dprint(h)
-    #
-    # # # test gradient of hamiltonian
-    # nabla_h = ch.nabla_1_ham
-    # z1 = jnp.zeros((ch.space.dim,)).at[ch.space.dim//2+1].set(1.0)
-    # n = nabla_h(z1,None)
-    # dprint(n.shape)
-    # dprint(n)
-    # # compare with naive implementation
-    # def naive_nabla_h(z1, z2):
-    #     stiffness = ch.eps * ch.space.l2_stiffness_matrix @ z1
-    #     v_quad, _ = ch.space.eval_coeffs_quad(z1)
-    #     Wprime_quad = ch.Wprime(v_quad)
-    #     Wprime_gbf = jnp.einsum('tq,btq->btq', Wprime_quad, ch.space.gbf_quad)
-    #     potential = 1 / ch.eps * jnp.sum(ch.space.quadrature_with_values_mapped(Wprime_gbf), axis=1)
-    #     return stiffness + potential
-    # naive_n = naive_nabla_h(z1,None)
-    # dprint(naive_n.shape)
-    # dprint(naive_n)
-    # dprint(jnp.linalg.norm(n-naive_n))
-    # # compare with projected implementation
-    # def non_discrete_nabla_ham(v_at_quad_nodes, nabla_v_at_quad_nodes):
-    #     """
-    #     computes the vector
-    #
-    #     [ int_Omega eps * nabla v.T * nabla gbf_i + eps^-1 * gbf_i * Wprime(v) dx ]_{i=1,...,dim}
-    #     =
-    #     [ < nabla ham(v), phi_i > ]_{i=1,...,dim}
-    #     =
-    #     [ < proj nabla ham(v), phi_i > ]_{i=1,...,dim}
-    #     =
-    #     mass_matrix @ coeffs(proj nabla ham(v))
-    #
-    #     ---> the projection is happening implicitely and does not need to be included
-    #     """
-    #     Wprime_quad = ch.Wprime(v_at_quad_nodes) # shape (t, q)
-    #     Wprime_gbf_quad = jnp.einsum('tq,btq->btq', Wprime_quad, ch.space.gbf_quad) # shape (b, t, q)
-    #     potential = 1 / ch.eps * jnp.sum(ch.space.quadrature_with_values_mapped(Wprime_gbf_quad), axis=1) # shape (b,)
-    #     nabla_v_grad_gbf_quad = jnp.einsum('tqn,btqn->btq', nabla_v_at_quad_nodes, ch.space.grad_gbf_quad) # shape (b, t, q)
-    #     stiffness = ch.eps * jnp.sum(ch.space.quadrature_with_values_mapped(nabla_v_grad_gbf_quad), axis=1) # shape (b,)
-    #     return potential + stiffness
-    # def projected_nabla_h(z1, z2):
-    #     """
-    #     z1 = coeffs to v
-    #     z2 = unused
-    #     """
-    #     # compute v at quad nodes and grad v at quad nodes
-    #     v_quad, nabla_v_quad = ch.space.eval_coeffs_quad(z1)
-    #     # compute nabla_1 ham coeffs
-    #     n = non_discrete_nabla_ham(v_quad, nabla_v_quad)
-    #     return n
-    # proj_n = projected_nabla_h(z1,None)
-    # dprint(proj_n.shape)
-    # dprint(proj_n)
-    # dprint(jnp.linalg.norm(n-proj_n))
-    
-    # simulate cahn hilliard system
-    ch = CahnHilliard()
-    
-    z0_manufactured_solution, manufactured_solution, control_manufactured_solution, g_manufactured_solution = ch.get_manufactured_solution() # todo: remove
-    
-    # simulation settings
-    T = 1.5
-    nt = int(T*100)+1
-    tt = jnp.linspace(0, T, nt+1)
-    # control = ch.default_control
-    # z0 = ch.initial_condition
-    degree = 2
-    
-    # run simulation with projection method
-    s = timer()
-    proj_solution = projection_method(
-        ebm=ch,
-        tt=tt,
-        z0=z0_manufactured_solution,
-        control=control_manufactured_solution,
-        degree=degree,
-        num_quad_nodes=degree+1,
-        num_proj_nodes=2*degree,
-        g_manufactured_solution=g_manufactured_solution,
-        debug=True,
-        )
-    e = timer()
-    print(f'\nprojection method took {e-s:.2f} seconds')
-    zz_proj = proj_solution['boundaries'][1]
-    
-    # # visualize energy balance error
-    # from helpers.errors import energy_balance_error
-    # eb_error = energy_balance_error(
-    #     proj_solution,
-    #     ch,
-    #     control,
-    #     )
-    # print(f'maximum energy balance error = {jnp.max(eb_error):.2e}')
-    # import matplotlib.pyplot as plt
-    # from helpers.other import mpl_settings
-    # mpl_settings()
-    # plt.semilogy(tt[1:], eb_error, label='cahn hilliard')
-    # plt.legend()
-    # plt.ylim(1.5e-18, 1.5e-3)
-    # plt.title('energy balance error')
-    # plt.xlabel('$t$')
-    # plt.ylabel('error')
-    # plt.tight_layout()
-    # plt.show()
-    
-    
-    
-    
-    
-    #
-    # zz_proj_1 = zz_proj[:, :ch.dims[0]]
-    # zz_proj_2 = zz_proj[:, ch.dims[0]:ch.dims[0]+ch.dims[1]]
-    # plt.semilogy(tt, ch.hamiltonian_vmap(zz_proj_1, zz_proj_2), label='cahn hilliard hamiltonian')
-    # plt.legend()
-    # plt.title('cahn hilliard hamiltonian')
-    # plt.xlabel('$t$')
-    # plt.ylabel('$\mathcal{H}(t)$')
-    # plt.tight_layout()
-    # plt.show()
-    #
-    # ch.space.visualize_coefficient_vector(
-    #     zz_proj[0, :ch.dims[0]],
-    #     title=f'$v({0*T:.1f})$, projection method, $\\varepsilon={ch.eps:.2f}, \\sigma={ch.sigma:.2f}$',
-    #     )
-    # ch.space.visualize_coefficient_vector(
-    #     zz_proj[1*nt//4, :ch.dims[0]],
-    #     title=f'$v({1*T/4:.1f})$, projection method, $\\varepsilon={ch.eps:.2f}, \\sigma={ch.sigma:.2f}$',
-    #     )
-    # ch.space.visualize_coefficient_vector(
-    #     zz_proj[2*nt//4, :ch.dims[0]],
-    #     title=f'$v({2*T/4:.1f})$, projection method, $\\varepsilon={ch.eps:.2f}, \\sigma={ch.sigma:.2f}$',
-    #     )
-    # ch.space.visualize_coefficient_vector(
-    #     zz_proj[3*nt//4, :ch.dims[0]],
-    #     title=f'$v({3*T/4:.1f})$, projection method, $\\varepsilon={ch.eps:.2f}, \\sigma={ch.sigma:.2f}$',
-    #     )
-    # ch.space.visualize_coefficient_vector(
-    #     zz_proj[-1, :ch.dims[0]],
-    #     title=f'$v({T:.1f})$, projection method, $\\varepsilon={ch.eps:.2f}, \\sigma={ch.sigma:.2f}$',
-    #     )
-    
-    d1, d2, d3 = ch.dims
-    
-    zz_man = manufactured_solution(tt)
-    
-    error_1 = zz_proj[:, :d1] - zz_man[:, :d1]
-    error_2 = zz_proj[:, d1:] - zz_man[:, d1:]
-    
-    # ch.space.visualize_coefficient_vector(
-    #     error_1[0,:],
-    #     title=f'error in $v$ at time ${0:.2f}$',
-    #     )
-    # ch.space.visualize_coefficient_vector(
-    #     error_1[1*nt//4, :],
-    #     title=f'error in $v$ at time ${1*T/4:.2f}$',
-    #     )
-    # ch.space.visualize_coefficient_vector(
-    #     error_1[2*nt//4, :],
-    #     title=f'error in $v$ at time ${2*T/4:.2f}$',
-    #     )
-    # ch.space.visualize_coefficient_vector(
-    #     error_1[3*nt//4, :],
-    #     title=f'error in $v$ at time ${3*T/4:.2f}$',
-    #     )
-    # ch.space.visualize_coefficient_vector(
-    #     error_1[-1, :],
-    #     title=f'error in $v$ at time ${T:.2f}$',
-    #     )
-    #
-    # ch.space.visualize_coefficient_vector(
-    #     error_2[0,:],
-    #     title=f'error in $w$ at time ${0:.2f}$',
-    #     )
-    # ch.space.visualize_coefficient_vector(
-    #     error_2[1*nt//4, :],
-    #     title=f'error in $w$ at time ${1*T/4:.2f}$',
-    #     )
-    # ch.space.visualize_coefficient_vector(
-    #     error_2[2*nt//4, :],
-    #     title=f'error in $w$ at time ${2*T/4:.2f}$',
-    #     )
-    # ch.space.visualize_coefficient_vector(
-    #     error_2[3*nt//4, :],
-    #     title=f'error in $w$ at time ${3*T/4:.2f}$',
-    #     )
-    # ch.space.visualize_coefficient_vector(
-    #     error_2[-1, :],
-    #     title=f'error in $w$ at time ${T:.2f}$',
-    #     )
-    
-    z1 = zz_proj[:, :d1]
-    z3 = zz_proj[:, d1:]
-    #
-    # ch.space.visualize_coefficient_vector(
-    #     z1[0,:],
-    #     title=f'computed $v$ at time ${0:.2f}$',
-    #     )
-    # ch.space.visualize_coefficient_vector(
-    #     z1[1*nt//4, :],
-    #     title=f'computed $v$ at time ${1*T/4:.2f}$',
-    #     )
-    # ch.space.visualize_coefficient_vector(
-    #     z1[2*nt//4, :],
-    #     title=f'computed $v$ at time ${2*T/4:.2f}$',
-    #     )
-    # ch.space.visualize_coefficient_vector(
-    #     z1[3*nt//4, :],
-    #     title=f'computed $v$ at time ${3*T/4:.2f}$',
-    #     )
-    # ch.space.visualize_coefficient_vector(
-    #     z1[-1, :],
-    #     title=f'computed $v$ at time ${T:.2f}$',
-    #     )
-    #
-    ch.space.visualize_coefficient_vector(
-        z3[0,:],
-        title=f'computed $w$ at time ${0:.2f}$',
-        )
-    ch.space.visualize_coefficient_vector(
-        z3[1*nt//4, :],
-        title=f'computed $w$ at time ${1*T/4:.2f}$',
-        )
-    ch.space.visualize_coefficient_vector(
-        z3[2*nt//4, :],
-        title=f'computed $w$ at time ${2*T/4:.2f}$',
-        )
-    ch.space.visualize_coefficient_vector(
-        z3[3*nt//4, :],
-        title=f'computed $w$ at time ${3*T/4:.2f}$',
-        )
-    ch.space.visualize_coefficient_vector(
-        z3[-1, :],
-        title=f'computed $w$ at time ${T:.2f}$',
-        )
-    
-    import matplotlib.pyplot as plt
-    plt.plot(tt, jnp.linalg.norm(z3, axis=1), label=r'norm $w(t)$')
-    plt.xlabel(r'time $t$')
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
-    
-    import matplotlib.pyplot as plt
-    plt.plot(tt, jnp.linalg.norm(jnp.einsum('nm,...m->...n', ch.space.l2_stiffness_matrix.todense(), z3), axis=1), label=r'norm $K w(t)$')
-    plt.xlabel(r'time $t$')
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
     
     
     

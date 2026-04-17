@@ -30,7 +30,7 @@ def eval_proj_solution(
         ebm: EnergyBasedModel,
         tt_ref: jnp.ndarray,
         proj_solution: dict,
-        resample_step: float,
+        resample_step: int,
         ):
     """
     this method evaluates the spp solution on a given reference
@@ -61,10 +61,24 @@ def eval_proj_solution(
     tt_j_shift = (2*tt_j - t_j - t_jp1)/(t_jp1 - t_j) # shift to [-1,1]
 
     # since tt_j_shift will be the same for every interval, we can precompute scaled_legendre once
+    # returns psi evaluations (shape: degree+1, t) and their derivatives
     scaled_legendre_values, dt_scaled_legendre_values = scaled_legendre(degree, tt_j_shift)
 
+    M = coefflist.shape[0]
+    num_coeffs_12 = (degree+1) * (d1+d2)
+    
+    # unpack the flattened coefficients into the distinct shapes for z1,z2 and z3
+    coeffs12 = coefflist[:, :num_coeffs_12].reshape((M, degree+1, d1+d2))
+    coeffs3 = coefflist[:, num_coeffs_12:].reshape((M, degree, d3))
+
     # calculate values in subintervals with einsum -> for every subinterval at once
-    values_j_all = jnp.einsum('MkD,kt->MtD', coefflist, scaled_legendre_values)
+    # z1 and z2 use all basis functions (degree + 1)
+    values_12_j_all = jnp.einsum('Mkd,kt->Mtd', coeffs12, scaled_legendre_values)
+    # z3 uses one degree less (degree), so we drop the highest-order basis function (:-1)
+    values_3_j_all = jnp.einsum('Mkd,kt->Mtd', coeffs3, scaled_legendre_values[:-1, :])
+
+    # concatenate them along the dimension axis
+    values_j_all = jnp.concatenate((values_12_j_all, values_3_j_all), axis=-1)
 
     # the values we need are just a reshape away
     values = values_j_all.reshape((-1,d1+d2+d3))
@@ -72,11 +86,11 @@ def eval_proj_solution(
     # the final value is missed, set it manually
     values = jnp.concatenate((values, zz_proj[-1,:][None,:]),axis=0)
     
-    # handle derivative
+    # handle derivative (only for z1 and z2)
     if d1+d2 == 0:
         dt_values_12 = jnp.zeros((tt_ref.shape[0]-1, 0))
     else:
-        dt_values_12_j_all = jnp.einsum('Mkd,kt->Mtd', coefflist[:,:,:d1+d2], dt_scaled_legendre_values) * 2/(t_jp1 - t_j)
+        dt_values_12_j_all = jnp.einsum('Mkd,kt->Mtd', coeffs12, dt_scaled_legendre_values) * 2/(t_jp1 - t_j)
         dt_values_12 = dt_values_12_j_all.reshape((-1,d1+d2))
         dt_values_12 = jnp.concatenate((dt_values_12, dt_zz_12_proj[-1,:d1+d2][None,:]),axis=0)
         dt_values_12 = dt_values_12[1:,:] # exclude the first value in the derivative as it is not meaningful
@@ -94,10 +108,9 @@ def calculate_projection_method_errors(
         control: callable,
         tt_ref: jnp.ndarray,
         zz_ref: jnp.ndarray,
-        g_tt_ref: jnp.ndarray,
-        B_u_tt_ref: jnp.ndarray,
         ref_order_smaller: int,
         g_manufactured_solution: callable = None,
+        use_projection: bool = True,
         use_pickle: bool = True,
         nodal_superconvergence: bool = False,
         include_algebraic_error: bool = True,
@@ -107,21 +120,18 @@ def calculate_projection_method_errors(
     
     # get necessary information from energy based model
     d1, d2, d3 = ebm.dims
-    J = ebm.J_vmap
-    R = ebm.R_vmap
-    B = ebm.B_vmap
-    nabla_2_ham = ebm.nabla_2_ham_vmap
     
     if use_pickle: assert picklepath is not None, 'if use_pickle is True, picklepath must be specified'
     
     errors = []
-    num_Delta_t_steps = len(nt_array)
 
     for k, nt in enumerate(nt_array):
         
         nt = nt.item()
 
         picklename = f'{picklepath}_n{degree}_qn{num_quad_nodes}_pn{num_proj_nodes}_M{nt}'
+        if not use_projection:
+            picklename += '_no_projection'
         
         proj_solution = None
         
@@ -134,6 +144,7 @@ def calculate_projection_method_errors(
                 pass
             
         if proj_solution is None:
+            
             tt = jnp.linspace(0,T,nt)
 
             s_proj = timer()
@@ -146,6 +157,7 @@ def calculate_projection_method_errors(
                 num_proj_nodes=num_proj_nodes,
                 num_quad_nodes=num_quad_nodes,
                 g_manufactured_solution=g_manufactured_solution,
+                use_projection=use_projection,
                 debug=debug,
                 )
             e_proj = timer()
@@ -156,17 +168,6 @@ def calculate_projection_method_errors(
                 pickle.dump({'proj_solution':proj_solution},f)
             print(f'\tresult was written')
         
-        # zz_proj_init = proj_solution['boundaries'][1][1,:]
-        # zz_proj_mid = proj_solution['boundaries'][1][nt//2,:]
-        # zz_proj_end = proj_solution['boundaries'][1][-1,:]
-        # d1, d2, d3 = ebm.dims
-        # ebm.space.visualize_coefficient_vector(zz_proj_init[:d1], title='$v$ start')
-        # ebm.space.visualize_coefficient_vector(zz_proj_init[d1:], title='$w$ start')
-        # ebm.space.visualize_coefficient_vector(zz_proj_mid[:d1], title='$v$ mid')
-        # ebm.space.visualize_coefficient_vector(zz_proj_mid[d1:], title='$w$ mid')
-        # ebm.space.visualize_coefficient_vector(zz_proj_end[:d1], title='$v$ end')
-        # ebm.space.visualize_coefficient_vector(zz_proj_end[d1:], title='$w$ end')
-        
         if nodal_superconvergence: # analyze superconvergence
 
             # eval reference solution on coarse time gitter
@@ -176,89 +177,66 @@ def calculate_projection_method_errors(
             # compute error in non-algebraic variables
             error_12 = zz_ref_resampled[:,:d1+d2] - zz_proj[:,:d1+d2]
             
-            # compute the defect in the algebraic constraint
-            z1 = zz_proj[1:,:d1] # 1: in time axis to match other dimensions (no derivative at initial time point)
-            z2 = zz_proj[1:,d1:d1+d2]
-            z3 = zz_proj[1:,d1+d2:]
-            dt_z1 = dt_zz_12_proj[:,:d1]
-            h2 = nabla_2_ham(z1, z2)
-            g = g_manufactured_solution(tt[1:])
-            u = control(tt[1:])
-            rhs = J(dt_z1, h2, z3) - R(dt_z1, h2, z3) + B(u) + g
-            error_3 = rhs[:,d1+d2:]
+            # z3 variable is not supported in nodal_superconvergence
+            error_3 = 0.0*zz_ref_resampled[:,d1+d2:]
             
         else:
             
-            tt, zz_proj, dt_zz_12_proj = proj_solution['boundaries'] # function values at boundaries
-
-            # eval proj solution on reference gitter
+            # eval proj solution on reference gitter for z1 and z2 variables
             zz_proj_on_tt_ref, dt_zz_12_proj_on_tt_ref = eval_proj_solution(
                 ebm=ebm,
                 tt_ref=tt_ref,
                 proj_solution=proj_solution,
                 resample_step=2**(k+ref_order_smaller)
                 )
-        
-            # compute error in non-algebraic variables
-            error_12 = zz_ref[:,:d1+d2] - zz_proj_on_tt_ref[:,:d1+d2]
             
-            # # compute the defect in the algebraic constraint, only in time grid points
-            # if include_algebraic_error:
-            #     z1 = zz_proj[1:,:d1] # 1: in time axis to match other dimensions (no derivative at initial time point)
-            #     z2 = zz_proj[1:,d1:d1+d2]
-            #     z3 = zz_proj[1:,d1+d2:]
-            #     dt_z1 = dt_zz_12_proj[:,:d1]
-            #     h2 = nabla_2_ham(z1, z2)
-            #     g = g_tt_ref[::2**(k+ref_order_smaller),:][1:,:]
-            #     B_u = B_u_tt_ref[::2**(k+ref_order_smaller),:][1:,:]
-            #     rhs = J(dt_z1, h2, z3) - R(dt_z1, h2, z3) + B_u + g
-            #     error_3 = rhs[:,d1+d2:]
-            # else: # we can skip the calculation
-            #     error_3 = jnp.zeros((tt_ref, d3))
-            
-            error_3 = zz_ref[:,d1+d2:] - zz_proj_on_tt_ref[:,d1+d2:]
+            # compute errors in z1+z2 and z3 variables
+            error_12 = zz_ref[:,:d1+d2] - zz_proj_on_tt_ref[:,:d1+d2 ] # shape (tt_ref, d1+d2)
+            error_3 = zz_ref[:,d1+d2:] - zz_proj_on_tt_ref[:,d1+d2:] # shape (tt_ref, d3)
 
-        # compute relative error in non-algebraic variables
+
+        # compute error in non-algebraic variables
         if ebm.was_pde:
-            mass_norm = jax.vmap(lambda x: x.T @ ebm.space.mass_matrix @ x, in_axes=0)
-            error_12 = jnp.sqrt(mass_norm(error_12)) # only works if z1 or z2 is non existent
-        else:
-            error_12 = jnp.linalg.norm(error_12, axis=1) # norms along axis 1, since axis 0 are the time points
-        if not jnp.isclose(jnp.max(error_12), 0): # exclude d1+d2 = 0 case
-            if ebm.was_pde:
-                norming_12 = jnp.sqrt(mass_norm(zz_ref[:,:d1+d2])) # only works if z1 or z2 is non existent
+            spatial_norm_12 = jax.vmap(ebm.space.get_norm, in_axes=0)
+            
+            if hasattr(ebm, 'has_two_components'):
+                error_component_1 = spatial_norm_12(error_12[:, :ebm.space.dim])
+                error_component_2 = spatial_norm_12(error_12[:, ebm.space.dim:])
+                error_12 = error_component_1 + error_component_2
             else:
-                norming_12 = jnp.max(jnp.linalg.norm(zz_ref[:,:d1+d2], axis=1))
-            error_12 = error_12 / norming_12
-        
-        # compute error in algebraic variables - not relative, since reference is zero
-        # error_3 = jnp.linalg.norm(error_3, axis=1) # norms along axis 1, since axis 0 are the time points
-        
-        # compute relative error in algebraic variables
-        if ebm.was_pde:
-            mass_norm = jax.vmap(lambda x: x.T @ ebm.space.mass_matrix @ x, in_axes=0)
-            error_3 = jnp.sqrt(mass_norm(error_3)) # only works if z1 or z2 is non existent
+                error_12 = spatial_norm_12(error_12)
         else:
-            error_3 = jnp.linalg.norm(error_3, axis=1) # norms along axis 1, since axis 0 are the time points
-        if not jnp.isclose(jnp.max(error_3), 0): # exclude d3 = 0 case
-            if ebm.was_pde:
-                norming_3 = jnp.sqrt(mass_norm(zz_ref[:,d1+d2:])) # only works if z1 or z2 is non existent
-            else:
-                norming_3 = jnp.max(jnp.linalg.norm(zz_ref[:,d1+d2:], axis=1))
-            error_3 = error_3 / norming_3
-        
-        # visualize
-        # import matplotlib.pyplot as plt
-        # fig_err, ax_err = plt.subplots()
-        # ax_err.semilogy(error_3)
-        # fig_err.suptitle(f'error_3 over time, {nt=}')
-        # fig_err.show()
-        
-        # compute errors
+            error_12 = jnp.linalg.norm(error_12, axis=1)
+            
         max_error_12 = float(jnp.max(error_12))
-        min_error_3 = float(jnp.min(error_3))
+
+        # compute error in algebraic variables
+        if ebm.was_pde and include_algebraic_error:
+            spatial_norm_3 = jax.vmap(lambda x: ebm.space.get_norm(x), in_axes=0)
+        else:
+            spatial_norm_3 = jax.vmap(lambda x: jnp.sqrt(x.T @ jnp.eye(d3) @ x), in_axes=0)
+
+        error_3 = spatial_norm_3(error_3)
         max_error_3 = float(jnp.max(error_3))
-        avg_error_3 = float(jnp.average(error_3))
+
+        # compute norming in non-algebraic variables
+        if d1+d2 != 0:
+            zz_ref_12 = zz_ref_resampled[:,:d1+d2] if nodal_superconvergence else zz_ref[:,:d1+d2]
+            
+            if ebm.was_pde:
+                if hasattr(ebm, 'has_two_components'):
+                    norming_12 = spatial_norm_12(zz_ref_12[:, :ebm.space.dim]) + spatial_norm_12(zz_ref_12[:, ebm.space.dim:])
+                else:
+                    norming_12 = spatial_norm_12(zz_ref_12)
+                max_error_12 = max_error_12 / float(jnp.max(norming_12))
+            else:
+                max_error_12 = max_error_12 / float(jnp.max(jnp.linalg.norm(zz_ref_12, axis=1)))
+        
+        # compute norming in algebraic variables
+        if d3 != 0:
+            max_norming_3 = jnp.max(spatial_norm_3(zz_ref[:, d1+d2:]))
+            max_error_3 = max_error_3 / max_norming_3
+
         
         # save errors
         e = max_error_12
@@ -267,7 +245,6 @@ def calculate_projection_method_errors(
         errors.append(e)
         
     return errors
-
 
 def energy_balance_error(
         proj_solution: dict,
@@ -317,18 +294,23 @@ def energy_balance_error(
 
         tk, tkp1 = tt[k], tt[k+1]
 
-        coeffs123 = coefflist[k,:,:]
-        coeffs1 = coeffs123[:,:d1]
-        coeffs2 = coeffs123[:,d1:d1+d2]
-        coeffs3 = coeffs123[:,d1+d2:]
+        # Extract the flattened coefficients for the k-th timestep
+        coeffs_flat = coefflist[k, :]
+        num_coeffs_12 = (degree+1) * (d1+d2)
+        
+        # Unpack them into their respective variables and shapes
+        coeffs12 = coeffs_flat[:num_coeffs_12].reshape((degree+1, d1+d2))
+        coeffs1 = coeffs12[:, :d1]
+        coeffs2 = coeffs12[:, d1:d1+d2]
+        coeffs3 = coeffs_flat[num_coeffs_12:].reshape((degree, d3))
 
         # find dt_z1 at nqn_gauss_points and dt_z2 at n_gauss_points, d = d1 or d = d2
         dt_z1_nqn = jnp.einsum('Nd,Nt->td', coeffs1, psi_prime_at_nqn_gauss_points) * 2/(tkp1-tk) # factor for compensating for chain rule in shift: f on [-1,1] -> sqrt(2/(b-a)) f((2t - a - b)/(b-a)) on [a,b]
 
         # find z1, z2, z3 at nqn_gauss_points and z1, z2 at proj_gauss_points
-        z3_nqn = jnp.einsum('Nd,Nt->td', coeffs3, psi_at_nqn_gauss_points) # d = d3
         z1_npn = jnp.einsum('Nd,Nt->td', coeffs1, psi_at_npn_gauss_points) # d = d1
         z2_npn = jnp.einsum('Nd,Nt->td', coeffs2, psi_at_npn_gauss_points) # d = d2
+        z3_nqn = jnp.einsum('nd,nt->td', coeffs3, phi_at_nqn_gauss_points) # d = d3
         
         # find projection of nabla_2_ham at nqn_gauss_points
         proj_nabla_2_ham_nqn = project_with_gauss(npn_gauss_weights, phi_at_npn_gauss_points, nabla_2_ham(z1_npn, z2_npn), evaluate_with=phi_at_nqn_gauss_points)

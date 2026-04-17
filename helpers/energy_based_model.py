@@ -110,8 +110,6 @@ class EnergyBasedModel:
             fig.tight_layout()
         plt.show()
         return
-        
-        
     
 class EnergyBasedModel_LinearJR(EnergyBasedModel):
     
@@ -148,7 +146,7 @@ class EnergyBasedModel_LinearJRQ(EnergyBasedModel_LinearJR):
     def hamiltonian(self, z1, z2):
         z12 = jnp.hstack((z1,z2))
         return 1/2 * z12.T @ self.Q_matrix @ z12
-
+    
 
 if __name__ == '__main__':
     

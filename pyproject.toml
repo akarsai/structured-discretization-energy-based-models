@@ -1,0 +1,23 @@
+[project]
+name = "structured-discretization-energy-based-models"
+version = "0.2.0"
+description = "Code for the paper 'Structure-Preserving Discretization and Model Reduction for Energy-Based Models', R. Altmann, A. Karsai, P. Schulze"
+readme = "readme.md"
+requires-python = ">=3.14"
+dependencies = [
+    "jax>=0.6.0",
+    "lineax>=0.0.8",
+    "matplotlib>=3.10.3",
+    "numpy>=2.4.2",
+    "scipy>=1.16.1",
+    "fenics-basix>=0.0.13",
+]
+
+[tool.setuptools.packages.find]
+exclude = ["plots*", "results*", "uv.lock"]
+
+[tool.uv]
+package = true
+
+[tool.distutils.egg_info] 
+egg_base = ".build"

@@ -14,12 +14,36 @@ import jax
 jax.config.update("jax_debug_nans", True)
 import jax.numpy as jnp
 
-from helpers.legendre import scaled_legendre, legendre
+from functools import partial
 
-@jax.jit
+from scipy.special import roots_legendre
+
+
+def gauss_points_and_weights(
+        num_gauss_points: int
+        ) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    calculates the gauss points and weights for the gauss quadrature
+    on [-1,1] with n points using scipy functions
+
+    :param n: number of points
+    :return: gauss points and weights
+    """
+
+    gauss_points, gauss_weights = roots_legendre(num_gauss_points)
+    gauss_points = jnp.array(gauss_points)
+    gauss_weights = jnp.array(gauss_weights)
+
+
+    return gauss_points, gauss_weights
+
+
+
+@partial(jax.jit, static_argnames=['axis'])
 def gauss_quadrature_with_values(
         gauss_weights: jnp.ndarray,
         fvalues: jnp.ndarray,
+        axis: int | None = None,
         interval: tuple | None = None,
         length: float | None = None,
         ) -> float | jnp.ndarray:
@@ -38,6 +62,7 @@ def gauss_quadrature_with_values(
     on [-1,1]
 
     :param fvalues: values of function to project on the transformed gauss points (t1-t0)/2 x_i + (t0+t1)/2
+    :param axis: axis to integrate on (only -1 supported, default is first axis)
     :param interval: interval to calculate integral on (optional)
     :param length: length of the interval (optional, needed if interval is not provided)
     :return: projection calculated with gauss quadrature
@@ -47,8 +72,11 @@ def gauss_quadrature_with_values(
         t0, t1 = interval
         length = (t1-t0)
     # else length has to be provided
-
-    integral = length/2 * jnp.einsum('a,a...->...',gauss_weights,fvalues)
+    
+    if axis == -1:
+        integral = length/2 * jnp.einsum('a,...a->...',gauss_weights,fvalues)
+    else:
+        integral = length/2 * jnp.einsum('a,a...->...',gauss_weights,fvalues)
 
     return integral
 

@@ -26,10 +26,7 @@ if __name__ == '__main__':
     import pickle
     import matplotlib.pyplot as plt
     from helpers.other import mpl_settings
-    mpl_settings(fontsize=20)
-    
-    # set savepath
-    SAVEPATH = './results'
+    mpl_settings(fontsize=18)
     
     # simulation settings
     T = 1.5
@@ -40,9 +37,9 @@ if __name__ == '__main__':
     num_proj_nodes = 2*degree
     
     # set paths
-    savepath_fom = f'{SAVEPATH}/figures/cahn_hilliard'
+    savepath_fom = f'./results/figures/cahn_hilliard'
     savepath_rom = f'{savepath_fom}_rom'
-    picklepath = f'{SAVEPATH}/pickle/cahn_hilliard'
+    picklepath = f'./results/pickle/cahn_hilliard'
     picklename_fom = f'{picklepath}_n{degree}_qn{num_quad_nodes}_pn{num_proj_nodes}_M{nt}'
     picklename_rom = f'{picklepath}_rom_n{degree}_qn{num_quad_nodes}_pn{num_proj_nodes}_M{nt}'
     
@@ -114,11 +111,11 @@ if __name__ == '__main__':
 
     # plot hamiltonians
     ax_ham.set_xlabel('time $t$')
-    ax_ham.set_ylabel('Hamiltonian')
+    ax_ham.set_ylabel('energy')
     ax_ham.legend()
     fig_ham.tight_layout()
-    fig_ham.savefig(savepath_fom+'_hamiltonian.pgf')
-    fig_ham.savefig(savepath_fom+'_hamiltonian.png')
+    fig_ham.savefig(savepath_fom+'_hamiltonian.pgf', bbox_inches='tight', pad_inches=0.01)
+    fig_ham.savefig(savepath_fom+'_hamiltonian.png', bbox_inches='tight', pad_inches=0.01)
     print(f'figure saved under savepath {savepath_fom}_hamiltonian (as pgf and png)')
     fig_ham.suptitle('Hamiltonians for Cahn--Hilliard model')
     fig_ham.tight_layout()

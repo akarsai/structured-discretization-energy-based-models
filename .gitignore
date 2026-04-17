@@ -1,0 +1,7 @@
+# python
+*.py[codz]
+*.pickle
+uv.lock
+.venv
+# editors
+.idea
